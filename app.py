@@ -39,7 +39,7 @@ def parse_time_str(t_str: str) -> int:
     elif is_am and h == 12:
         h = 0
     elif not is_am and not is_pm and h < 8:
-        # Defaults afternoon circus hours if 2:00-6:00 without p
+        # Default circus afternoon show assumption if written as 2:00-6:00
         h += 12
 
     return h * 60 + m
@@ -56,15 +56,56 @@ def time_interval_overlaps(slot1: str, slot2: str) -> bool:
         s1, e1 = parse_time_str(p1[0]), parse_time_str(p1[1])
         s2, e2 = parse_time_str(p2[0]), parse_time_str(p2[1])
 
-        # Overlap if max(start) < min(end)
+        # Overlap exists if max(start) < min(end)
         return max(s1, s2) < min(e1, e2)
     except Exception:
-        # Default fallback: if identical slot string, they overlap
         return slot1 == slot2
 
 
 # -----------------------------------------------------------------------------
-# Data Ingestion & Sanitization
+# Google Sheet Live Ingestion (Cached 60s)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=60)
+def fetch_google_sheet_data(sheet_input: str, custom_gid: str = "") -> pd.DataFrame:
+    """Fetches CSV data live from Google Sheets using multiple fallback endpoints."""
+    clean_input = sheet_input.strip()
+    id_m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", clean_input)
+    sheet_id = id_m.group(1) if id_m else clean_input
+
+    gid_m = re.search(r"[#&?]gid=([0-9]+)", clean_input)
+    gid = custom_gid.strip() if custom_gid.strip() else (gid_m.group(1) if gid_m else "")
+
+    urls_to_try = []
+    if gid:
+        urls_to_try.append(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
+        )
+        urls_to_try.append(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+        )
+    urls_to_try.append(
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
+    )
+    urls_to_try.append(
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    )
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for u in urls_to_try:
+        try:
+            res = requests.get(u, headers=headers, timeout=8)
+            if res.status_code == 200 and len(res.content) > 50:
+                df = pd.read_csv(io.StringIO(res.text))
+                if not df.empty:
+                    return df
+        except Exception:
+            continue
+
+    return pd.DataFrame()
+
+
+# -----------------------------------------------------------------------------
+# Data Sanitization & Shift Extraction
 # -----------------------------------------------------------------------------
 def extract_time_slots_from_cell(cell_val) -> list:
     """Extracts line-separated time blocks from survey response cells."""
@@ -75,7 +116,7 @@ def extract_time_slots_from_cell(cell_val) -> list:
 
 
 def parse_raw_dataframe(raw_df: pd.DataFrame):
-    """Sanitizes names, removes TEST rows, and decomposes columns into concrete shifts."""
+    """Sanitizes names, filters out TEST submissions, and creates concrete shifts."""
     df = raw_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -108,14 +149,10 @@ def parse_raw_dataframe(raw_df: pd.DataFrame):
     )
     df = df[~test_filter].copy()
 
-    # Deduplicate: Keep latest submission per person
-    if "Submission ID" in df.columns:
-        df = df.drop_duplicates(subset=[name_col], keep="last")
-    else:
-        df = df.drop_duplicates(subset=[name_col], keep="last")
-    df = df.reset_index(drop=True)
+    # Deduplicate: Keep latest submission per volunteer
+    df = df.drop_duplicates(subset=[name_col], keep="last").reset_index(drop=True)
 
-    # Identify date/shift columns (ignore demographic and note columns)
+    # Ignore demographic and metadata columns
     ignore_cols = {
         first_col,
         last_col,
@@ -130,14 +167,11 @@ def parse_raw_dataframe(raw_df: pd.DataFrame):
         if c not in ignore_cols and "conflict" not in c.lower()
     ]
 
-    # Notes column
     notes_col = next((c for c in df.columns if "conflict" in c.lower()), None)
 
-    # Decompose columns & cell contents into Concrete Shifts
+    # Decompose into concrete shift instances
     concrete_shifts = []
-    # Dict: shift_key -> {"day": day, "time": slot, "role": role}
     shift_meta = {}
-    # Availability matrix: (crew_member, shift_key) -> bool
     availability_matrix = {}
 
     for col in date_cols:
@@ -151,7 +185,6 @@ def parse_raw_dataframe(raw_df: pd.DataFrame):
         else:
             role = "Operations (FOH / Ushers / Concessions)"
 
-        # Find all unique time blocks listed in this column
         unique_slots = set()
         for val in df[col].dropna():
             for slot in extract_time_slots_from_cell(val):
@@ -169,7 +202,6 @@ def parse_raw_dataframe(raw_df: pd.DataFrame):
                 "role": role,
             }
 
-    # Populate Availability Matrix
     crew_list = sorted(df[name_col].unique().tolist())
     for _, row in df.iterrows():
         person = row[name_col]
@@ -205,19 +237,18 @@ def solve_schedule(
         "Circus_Bella_Operations_Optimizer", pulp.LpMaximize
     )
 
-    # Decision variables: x[p, s] in {0, 1}
+    # Decision variables: x[crew, shift]
     x = {}
     for p in crew_list:
         for s in shifts:
             if availability_matrix.get((p, s), False):
-                # Clean variable names for PuLP
                 clean_p = re.sub(r"[^a-zA-Z0-9_]", "_", p)
                 clean_s = re.sub(r"[^a-zA-Z0-9_]", "_", s)
                 x[p, s] = pulp.LpVariable(
                     f"x_{clean_p}_{clean_s}", cat=pulp.LpBinary
                 )
 
-    # Slack variable for each shift to prevent infeasibility if understaffed
+    # Slack variables to flag unfilled slots without failing feasibility
     shortfall = {}
     for s in shifts:
         clean_s = re.sub(r"[^a-zA-Z0-9_]", "_", s)
@@ -225,7 +256,7 @@ def solve_schedule(
             f"shortfall_{clean_s}", lowBound=0, cat=pulp.LpInteger
         )
 
-    # Load-balancing tier variables: y[p, k] = 1 if person works >= k shifts
+    # Tier variables: y[p, k] = 1 if person works >= k shifts
     y = {}
     for p in crew_list:
         clean_p = re.sub(r"[^a-zA-Z0-9_]", "_", p)
@@ -234,7 +265,7 @@ def solve_schedule(
                 f"tier_{clean_p}_{k}", cat=pulp.LpBinary
             )
 
-    # 1. Shift Target Constraints
+    # 1. Headcount Target Constraints
     for s in shifts:
         assigned_p = [x[p, s] for p in crew_list if (p, s) in x]
         needed = shift_targets.get(s, 0)
@@ -251,7 +282,7 @@ def solve_schedule(
         for k in range(1, max_shifts_per_person):
             prob += y[p, k] >= y[p, k + 1]
 
-    # 3. Dynamic Overlap Constraints (Same day, overlapping time blocks)
+    # 3. Dynamic Overlap Constraints (Same day, overlapping times)
     day_to_shifts = {}
     for s in shifts:
         day_to_shifts.setdefault(shift_meta[s]["day"], []).append(s)
@@ -260,18 +291,15 @@ def solve_schedule(
         if len(day_shifts) > 1:
             for i in range(len(day_shifts)):
                 for j in range(i + 1, len(day_shifts)):
-                    s1 = day_shifts[i]
-                    s2 = day_shifts[j]
-                    t1 = shift_meta[s1]["time"]
-                    t2 = shift_meta[s2]["time"]
-
+                    s1, s2 = day_shifts[i], day_shifts[j]
+                    t1, t2 = shift_meta[s1]["time"], shift_meta[s2]["time"]
                     if time_interval_overlaps(t1, t2):
                         for p in crew_list:
                             if (p, s1) in x and (p, s2) in x:
                                 prob += x[p, s1] + x[p, s2] <= 1
 
     # Objective: Heavily penalize unfilled slots (-10,000 each)
-    # Tiered marginal penalty (2 * tier) ensures shifts are balanced evenly
+    # Tiered marginal penalty (2 * tier) ensures shifts are balanced evenly across crew
     unfilled_penalty = 10000 * pulp.lpSum([shortfall[s] for s in shifts])
     fairness_penalty = pulp.lpSum(
         [
@@ -309,82 +337,36 @@ def solve_schedule(
 
 
 # -----------------------------------------------------------------------------
-# Streamlit UI & Application Layout
+# Streamlit Application
 # -----------------------------------------------------------------------------
 def main():
     st.title("🎪 Circus Bella Bravura 2026")
     st.subheader("Operations & Strike Shift Optimizer")
 
     # --- SIDEBAR CONTROLS ---
-    st.sidebar.header("📥 Data Source")
+    st.sidebar.header("⚙️ Google Sheet Sync")
 
-    data_source_mode = st.sidebar.radio(
-        "Choose Ingestion Method:",
-        ["Direct CSV Upload (Instant)", "Google Sheet Live Sync"],
+    sheet_input = st.sidebar.text_input(
+        "Google Sheet Link or ID",
+        value=DEFAULT_SHEET_ID,
+        help="Paste the full Google Sheet browser URL or the Sheet ID.",
+    )
+    gid_override = st.sidebar.text_input(
+        "Worksheet GID (optional)",
+        value="",
+        placeholder="Auto-detected or check sheet URL",
     )
 
-    raw_df = pd.DataFrame()
+    if st.sidebar.button("🔄 Sync with Google Sheet", use_container_width=True):
+        st.cache_data.clear()
+        st.sidebar.success("Cache cleared! Live data refreshed.")
 
-    if data_source_mode == "Direct CSV Upload (Instant)":
-        uploaded_file = st.sidebar.file_uploader(
-            "Upload Survey CSV",
-            type=["csv"],
-            help="Export from Jotform or Google Sheets and drop it here.",
-        )
-        if uploaded_file is not None:
-            raw_df = pd.read_csv(uploaded_file)
-    else:
-        sheet_url = st.sidebar.text_input(
-            "Google Sheet Link or ID",
-            value=DEFAULT_SHEET_ID,
-            help="Paste full URL or Sheet ID.",
-        )
-        gid_val = st.sidebar.text_input(
-            "Worksheet GID",
-            value="",
-            placeholder="e.g. 174829392 (check end of sheet URL)",
-        )
-        if st.sidebar.button(
-            "🔄 Sync with Google Sheet", use_container_width=True
-        ):
-            st.cache_data.clear()
-
-        # Ingestion logic with fallbacks
-        sheet_id = sheet_url.strip()
-        id_m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
-        if id_m:
-            sheet_id = id_m.group(1)
-        gid_m = re.search(r"[#&?]gid=([0-9]+)", sheet_url)
-        if gid_m and not gid_val:
-            gid_val = gid_m.group(1)
-
-        urls = []
-        if gid_val:
-            urls.append(
-                f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid_val}"
-            )
-            urls.append(
-                f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid_val}"
-            )
-        urls.append(
-            f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
-        )
-        urls.append(
-            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-        )
-
-        for u in urls:
-            try:
-                res = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
-                if res.status_code == 200 and len(res.content) > 50:
-                    raw_df = pd.read_csv(io.StringIO(res.text))
-                    break
-            except Exception:
-                continue
+    # Ingest Data
+    raw_df = fetch_google_sheet_data(sheet_input, gid_override)
 
     if raw_df.empty:
-        st.info(
-            "👈 Please upload your survey CSV or connect the Google Sheet in the sidebar to begin."
+        st.error(
+            "⚠️ Unable to load Google Sheet data. Please check the Sheet ID and verify 'Anyone with the link can view' is turned on in Share settings."
         )
         st.stop()
 
@@ -405,11 +387,11 @@ def main():
         "Max Shifts Per Person",
         min_value=1,
         max_value=max(len(concrete_shifts), 1),
-        value=min(6, max(len(concrete_shifts), 1)),
+        value=min(8, max(len(concrete_shifts), 1)),
         help="Hard cap on total shifts assigned to any single individual.",
     )
 
-    # Tabs
+    # --- TABS ---
     tab_setup, tab_roster, tab_optimizer, tab_crew_view = st.tabs([
         "📋 Shift Targets & Roles",
         "👥 Survey Responses & Notes",
@@ -417,9 +399,7 @@ def main():
         "👤 Crew-Centric View",
     ])
 
-    # -------------------------------------------------------------
     # TAB 1: SHIFT REQUIREMENTS & HEADCOUNT
-    # -------------------------------------------------------------
     with tab_setup:
         st.markdown(
             "Adjust the **Needed Headcount** for each shift. Shifts occurring at the same time on the same date will automatically prevent double-booking."
@@ -443,15 +423,9 @@ def main():
         edited_config = st.data_editor(
             config_df,
             column_config={
-                "Shift Identifier": st.column_config.TextColumn(
-                    "Shift", disabled=True
-                ),
-                "Day / Event": st.column_config.TextColumn(
-                    "Day", disabled=True
-                ),
-                "Time Window": st.column_config.TextColumn(
-                    "Time", disabled=True
-                ),
+                "Shift Identifier": st.column_config.TextColumn("Shift", disabled=True),
+                "Day / Event": st.column_config.TextColumn("Day", disabled=True),
+                "Time Window": st.column_config.TextColumn("Time", disabled=True),
                 "Role / Scope": st.column_config.SelectboxColumn(
                     "Role Category",
                     options=[
@@ -483,9 +457,7 @@ def main():
         c1.metric("Total Headcount Needed", total_slots_needed)
         c2.metric("Total Availabilities Submitted", total_slots_offered)
 
-    # -------------------------------------------------------------
     # TAB 2: CREW AVAILABILITY & NOTES
-    # -------------------------------------------------------------
     with tab_roster:
         st.markdown(
             f"**Cleaned Submissions ({len(df)} crew members)** — *Test entries purged, duplicates removed.*"
@@ -513,15 +485,11 @@ def main():
             use_container_width=True,
         )
 
-    # -------------------------------------------------------------
     # TAB 3: RUN OPTIMIZER & MASTER SCHEDULE
-    # -------------------------------------------------------------
     with tab_optimizer:
         st.markdown("### Run PuLP Optimization Engine")
 
-        if st.button(
-            "🚀 Run Optimization", type="primary", use_container_width=True
-        ):
+        if st.button("🚀 Run Optimization", type="primary", use_container_width=True):
             with st.spinner("Finding optimal schedule with PuLP CBC..."):
                 status, assignments, crew_totals, crew_shifts, shortfall_counts = (
                     solve_schedule(
@@ -595,9 +563,7 @@ def main():
                     mime="text/csv",
                 )
 
-    # -------------------------------------------------------------
     # TAB 4: CREW-CENTRIC VIEW
-    # -------------------------------------------------------------
     with tab_crew_view:
         if "opt_results" in st.session_state:
             results = st.session_state["opt_results"]
