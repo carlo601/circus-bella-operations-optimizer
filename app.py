@@ -402,7 +402,7 @@ def main():
     # TAB 1: SHIFT REQUIREMENTS & HEADCOUNT
     with tab_setup:
         st.markdown(
-            "Adjust the **Needed Headcount** for each shift. Shifts occurring at the same time on the same date will automatically prevent double-booking."
+            "Adjust the **Crew Need** for each shift. Shifts occurring at the same time on the same date will automatically prevent double-booking."
         )
 
         default_config = []
@@ -415,7 +415,7 @@ def main():
                 "Day / Event": meta["day"],
                 "Time Window": meta["time"],
                 "Role / Scope": role,
-                "Needed Headcount": needed,
+                "Crew Need": needed,
             })
 
         config_df = pd.DataFrame(default_config)
@@ -436,8 +436,8 @@ def main():
                     ],
                     required=True,
                 ),
-                "Needed Headcount": st.column_config.NumberColumn(
-                    "Needed Headcount", min_value=0, max_value=50, step=1
+                "Crew Need": st.column_config.NumberColumn(
+                    "Crew Need", min_value=0, max_value=50, step=1
                 ),
             },
             hide_index=True,
@@ -447,7 +447,7 @@ def main():
         shift_targets = dict(
             zip(
                 edited_config["Shift Identifier"],
-                edited_config["Needed Headcount"].astype(int),
+                edited_config["Crew Need"].astype(int),
             )
         )
         total_slots_needed = sum(shift_targets.values())
