@@ -1,15 +1,15 @@
 import io
 import re
-import urllib.parse
 import pandas as pd
 import pulp
+import requests
 import streamlit as st
 
 # -----------------------------------------------------------------------------
 # Configuration & Page Setup
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Circus Bella Bravura - Operations & Strike Optimizer",
+    page_title="Circus Bella Bravura 2026 - Ops & Strike Optimizer",
     page_icon="🎪",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -19,107 +19,174 @@ DEFAULT_SHEET_ID = "1mrqG1ENDb2p3OvQGv6KwjCRgHs1by2s6KUjHJ1ZC9OQ"
 
 
 # -----------------------------------------------------------------------------
+# Time Helpers & Overlap Detection
+# -----------------------------------------------------------------------------
+def parse_time_str(t_str: str) -> int:
+    """Converts time strings like '11:00a', '2:00p', '14:00', '18:00p' to minutes from midnight."""
+    t_str = t_str.strip().lower()
+    is_pm = "p" in t_str
+    is_am = "a" in t_str
+    clean_t = re.sub(r"[ap]", "", t_str).strip()
+
+    if ":" in clean_t:
+        parts = clean_t.split(":")
+        h, m = int(parts[0]), int(parts[1])
+    else:
+        h, m = int(clean_t), 0
+
+    if is_pm and h < 12:
+        h += 12
+    elif is_am and h == 12:
+        h = 0
+    elif not is_am and not is_pm and h < 8:
+        # Defaults afternoon circus hours if 2:00-6:00 without p
+        h += 12
+
+    return h * 60 + m
+
+
+def time_interval_overlaps(slot1: str, slot2: str) -> bool:
+    """Checks if two shift intervals on the same day overlap in time."""
+    try:
+        p1 = [p.strip() for p in slot1.split("-")]
+        p2 = [p.strip() for p in slot2.split("-")]
+        if len(p1) != 2 or len(p2) != 2:
+            return False
+
+        s1, e1 = parse_time_str(p1[0]), parse_time_str(p1[1])
+        s2, e2 = parse_time_str(p2[0]), parse_time_str(p2[1])
+
+        # Overlap if max(start) < min(end)
+        return max(s1, s2) < min(e1, e2)
+    except Exception:
+        # Default fallback: if identical slot string, they overlap
+        return slot1 == slot2
+
+
+# -----------------------------------------------------------------------------
 # Data Ingestion & Sanitization
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=60)
-def load_survey_data(sheet_id: str, gid: str = "0") -> pd.DataFrame:
-    """Fetches CSV export directly from Google Sheets."""
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    try:
-        df = pd.read_csv(url)
-        return df
-    except Exception as e:
-        st.error(f"Failed to fetch data from Google Sheet. Error: {e}")
-        return pd.DataFrame()
+def extract_time_slots_from_cell(cell_val) -> list:
+    """Extracts line-separated time blocks from survey response cells."""
+    if pd.isna(cell_val):
+        return []
+    raw = str(cell_val).replace("\r", "\n").split("\n")
+    return [line.strip() for line in raw if line.strip()]
 
 
-def clean_and_parse_roster(df: pd.DataFrame):
-    """Sanitizes names, removes TEST rows, deduplicates, and extracts shift columns."""
-    if df.empty:
-        return pd.DataFrame(), [], ""
-
-    # Normalize column names
-    df = df.copy()
+def parse_raw_dataframe(raw_df: pd.DataFrame):
+    """Sanitizes names, removes TEST rows, and decomposes columns into concrete shifts."""
+    df = raw_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Detect Timestamp column
-    timestamp_col = next(
-        (c for c in df.columns if "timestamp" in c.lower()), None
-    )
+    # Combine First and Last Name
+    first_col = next((c for c in df.columns if "first name" in c.lower()), None)
+    last_col = next((c for c in df.columns if "last name" in c.lower()), None)
 
-    # Detect Crew Name column
-    name_col = next(
-        (
-            c
-            for c in df.columns
-            if any(k in c.lower() for k in ["name", "full name", "first name"])
-        ),
-        None,
-    )
-    if not name_col:
-        # Fallback to second column if timestamp is first
-        name_col = (
-            df.columns[1]
-            if len(df.columns) > 1 and timestamp_col == df.columns[0]
-            else df.columns[0]
+    if first_col and last_col:
+        df["Full Name"] = (
+            df[first_col].fillna("").astype(str).str.strip()
+            + " "
+            + df[last_col].fillna("").astype(str).str.strip()
         )
+    elif first_col:
+        df["Full Name"] = df[first_col].astype(str).str.strip()
+    else:
+        df["Full Name"] = df[df.columns[0]].astype(str).str.strip()
 
-    # 1. Clean Names & remove TEST submissions
-    df[name_col] = df[name_col].astype(str).str.strip()
-    df = df[
-        ~df[name_col].str.contains(
-            r"^\s*$|test|sample|dummy", case=False, na=False
+    name_col = "Full Name"
+
+    # Filter out TEST submissions
+    test_filter = (
+        df[name_col].str.contains(r"test|dummy|sample", case=False, na=False)
+        | (
+            df["Email"].astype(str).str.contains(r"test@test\.com", case=False)
+            if "Email" in df.columns
+            else False
         )
-    ]
-
-    # 2. Deduplicate: Keep latest submission per person
-    if timestamp_col:
-        df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
-        df = df.sort_values(by=timestamp_col, ascending=True)
-
-    df = df.drop_duplicates(subset=[name_col], keep="last").reset_index(
-        drop=True
+        | (df[name_col] == "")
     )
+    df = df[~test_filter].copy()
 
-    # 3. Identify Shift Columns (exclude metadata columns like Timestamp, Email, Notes, Phone)
-    meta_keywords = [
-        "timestamp",
-        "name",
-        "email",
-        "phone",
-        "comments",
-        "notes",
-        "dietary",
-        "experience",
-        "shirt",
-    ]
-    shift_cols = [
+    # Deduplicate: Keep latest submission per person
+    if "Submission ID" in df.columns:
+        df = df.drop_duplicates(subset=[name_col], keep="last")
+    else:
+        df = df.drop_duplicates(subset=[name_col], keep="last")
+    df = df.reset_index(drop=True)
+
+    # Identify date/shift columns (ignore demographic and note columns)
+    ignore_cols = {
+        first_col,
+        last_col,
+        name_col,
+        "Email",
+        "Phone Number",
+        "Submission ID",
+    }
+    date_cols = [
         c
         for c in df.columns
-        if not any(k in c.lower() for k in meta_keywords)
-        and c not in [timestamp_col, name_col]
+        if c not in ignore_cols and "conflict" not in c.lower()
     ]
 
-    return df, shift_cols, name_col
+    # Notes column
+    notes_col = next((c for c in df.columns if "conflict" in c.lower()), None)
 
+    # Decompose columns & cell contents into Concrete Shifts
+    concrete_shifts = []
+    # Dict: shift_key -> {"day": day, "time": slot, "role": role}
+    shift_meta = {}
+    # Availability matrix: (crew_member, shift_key) -> bool
+    availability_matrix = {}
 
-def is_available(value) -> bool:
-    """Interprets survey cell values into Boolean availability."""
-    if pd.isna(value):
-        return False
-    val_str = str(value).strip().lower()
-    negative_answers = {
-        "no",
-        "n",
-        "unavailable",
-        "not available",
-        "0",
-        "false",
-        "none",
-        "",
-        "-",
-    }
-    return val_str not in negative_answers
+    for col in date_cols:
+        col_lower = col.lower()
+        if "strike" in col_lower:
+            role = "Strike Crew"
+        elif "concession" in col_lower and "training" in col_lower:
+            role = "Concessions Training"
+        elif "set-up" in col_lower:
+            role = "Set-up Crew"
+        else:
+            role = "Operations (FOH / Ushers / Concessions)"
+
+        # Find all unique time blocks listed in this column
+        unique_slots = set()
+        for val in df[col].dropna():
+            for slot in extract_time_slots_from_cell(val):
+                unique_slots.add(slot)
+
+        if not unique_slots:
+            unique_slots.add("Standard Shift")
+
+        for slot in sorted(list(unique_slots)):
+            shift_key = f"{col} [{slot}]"
+            concrete_shifts.append(shift_key)
+            shift_meta[shift_key] = {
+                "day": col,
+                "time": slot,
+                "role": role,
+            }
+
+    # Populate Availability Matrix
+    crew_list = sorted(df[name_col].unique().tolist())
+    for _, row in df.iterrows():
+        person = row[name_col]
+        for shift_key in concrete_shifts:
+            day = shift_meta[shift_key]["day"]
+            slot = shift_meta[shift_key]["time"]
+            cell_slots = extract_time_slots_from_cell(row.get(day, None))
+            availability_matrix[(person, shift_key)] = slot in cell_slots
+
+    return (
+        df,
+        crew_list,
+        concrete_shifts,
+        shift_meta,
+        availability_matrix,
+        notes_col,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -128,82 +195,83 @@ def is_available(value) -> bool:
 def solve_schedule(
     crew_list: list,
     shifts: list,
+    shift_meta: dict,
     availability_matrix: dict,
     shift_targets: dict,
-    overlap_groups: dict,
     max_shifts_per_person: int,
 ):
-    """Solves the Operations & Strike assignment problem with load-balancing."""
+    """Solves the assignment problem with load-balancing and time overlap exclusion."""
     prob = pulp.LpProblem(
         "Circus_Bella_Operations_Optimizer", pulp.LpMaximize
     )
 
-    # Decision variables: x[crew, shift] in {0, 1}
+    # Decision variables: x[p, s] in {0, 1}
     x = {}
     for p in crew_list:
         for s in shifts:
             if availability_matrix.get((p, s), False):
-                x[p, s] = pulp.LpVariable(f"x_{p}_{s}", cat=pulp.LpBinary)
-
-    # Shortfall variables to guarantee feasibility when understaffed
-    shortfall = {}
-    for s in shifts:
-        shortfall[s] = pulp.LpVariable(
-            f"shortfall_{s}", lowBound=0, cat=pulp.LpInteger
-        )
-
-    # Fairness linearization variables: y[p, k] = 1 if person p works >= k shifts
-    y = {}
-    for p in crew_list:
-        for k in range(1, max_shifts_per_person + 1):
-            y[p, k] = pulp.LpVariable(f"tier_{p}_{k}", cat=pulp.LpBinary)
-
-    # ------------------ CONSTRAINTS ------------------
-
-    # 1. Shift Capacity / Target
-    for s in shifts:
-        assigned_crew = [x[p, s] for p in crew_list if (p, s) in x]
-        needed = shift_targets.get(s, 0)
-        # assigned + shortfall >= needed
-        prob += (
-            pulp.lpSum(assigned_crew) + shortfall[s] >= needed,
-            f"Demand_Min_{s}",
-        )
-        # Never assign more than needed
-        prob += pulp.lpSum(assigned_crew) <= needed, f"Demand_Max_{s}"
-
-    # 2. Maximum shifts per person & Fairness Tiers
-    for p in crew_list:
-        assigned_shifts = [x[p, s] for s in shifts if (p, s) in x]
-        # Max limit
-        prob += (
-            pulp.lpSum(assigned_shifts) <= max_shifts_per_person,
-            f"Max_Shifts_{p}",
-        )
-        # Link shift count to tier variables: sum(x) == sum(y)
-        prob += pulp.lpSum(assigned_shifts) == pulp.lpSum(
-            [y[p, k] for k in range(1, max_shifts_per_person + 1)]
-        ), f"Tier_Link_{p}"
-        # Order tiers: y[p, 1] >= y[p, 2] >= ...
-        for k in range(1, max_shifts_per_person):
-            prob += y[p, k] >= y[p, k + 1], f"Tier_Order_{p}_{k}"
-
-    # 3. Overlap Constraints (No concurrent shifts for the same person)
-    for group_name, grouped_shifts in overlap_groups.items():
-        if len(grouped_shifts) > 1:
-            for p in crew_list:
-                prob += (
-                    pulp.lpSum(
-                        [x[p, s] for s in grouped_shifts if (p, s) in x]
-                    )
-                    <= 1,
-                    f"No_Overlap_{p}_{group_name}",
+                # Clean variable names for PuLP
+                clean_p = re.sub(r"[^a-zA-Z0-9_]", "_", p)
+                clean_s = re.sub(r"[^a-zA-Z0-9_]", "_", s)
+                x[p, s] = pulp.LpVariable(
+                    f"x_{clean_p}_{clean_s}", cat=pulp.LpBinary
                 )
 
-    # ------------------ OBJECTIVE FUNCTION ------------------
-    # 1) Heavy penalty for unfilled required slots (-10,000 per missing crew)
-    # 2) Progressive marginal penalty for assigning extra shifts to the same person
-    #    (shift 1 costs 2, shift 2 costs 4, shift 3 costs 6, etc.) -> balances workload evenly
+    # Slack variable for each shift to prevent infeasibility if understaffed
+    shortfall = {}
+    for s in shifts:
+        clean_s = re.sub(r"[^a-zA-Z0-9_]", "_", s)
+        shortfall[s] = pulp.LpVariable(
+            f"shortfall_{clean_s}", lowBound=0, cat=pulp.LpInteger
+        )
+
+    # Load-balancing tier variables: y[p, k] = 1 if person works >= k shifts
+    y = {}
+    for p in crew_list:
+        clean_p = re.sub(r"[^a-zA-Z0-9_]", "_", p)
+        for k in range(1, max_shifts_per_person + 1):
+            y[p, k] = pulp.LpVariable(
+                f"tier_{clean_p}_{k}", cat=pulp.LpBinary
+            )
+
+    # 1. Shift Target Constraints
+    for s in shifts:
+        assigned_p = [x[p, s] for p in crew_list if (p, s) in x]
+        needed = shift_targets.get(s, 0)
+        prob += pulp.lpSum(assigned_p) + shortfall[s] >= needed
+        prob += pulp.lpSum(assigned_p) <= needed
+
+    # 2. Max Shifts Per Person & Fairness Tier Linking
+    for p in crew_list:
+        assigned_s = [x[p, s] for s in shifts if (p, s) in x]
+        prob += pulp.lpSum(assigned_s) <= max_shifts_per_person
+        prob += pulp.lpSum(assigned_s) == pulp.lpSum(
+            [y[p, k] for k in range(1, max_shifts_per_person + 1)]
+        )
+        for k in range(1, max_shifts_per_person):
+            prob += y[p, k] >= y[p, k + 1]
+
+    # 3. Dynamic Overlap Constraints (Same day, overlapping time blocks)
+    day_to_shifts = {}
+    for s in shifts:
+        day_to_shifts.setdefault(shift_meta[s]["day"], []).append(s)
+
+    for day, day_shifts in day_to_shifts.items():
+        if len(day_shifts) > 1:
+            for i in range(len(day_shifts)):
+                for j in range(i + 1, len(day_shifts)):
+                    s1 = day_shifts[i]
+                    s2 = day_shifts[j]
+                    t1 = shift_meta[s1]["time"]
+                    t2 = shift_meta[s2]["time"]
+
+                    if time_interval_overlaps(t1, t2):
+                        for p in crew_list:
+                            if (p, s1) in x and (p, s2) in x:
+                                prob += x[p, s1] + x[p, s2] <= 1
+
+    # Objective: Heavily penalize unfilled slots (-10,000 each)
+    # Tiered marginal penalty (2 * tier) ensures shifts are balanced evenly
     unfilled_penalty = 10000 * pulp.lpSum([shortfall[s] for s in shifts])
     fairness_penalty = pulp.lpSum(
         [
@@ -221,7 +289,6 @@ def solve_schedule(
 
     status = pulp.LpStatus[prob.status]
 
-    # Extract Results
     assignments = {s: [] for s in shifts}
     crew_totals = {p: 0 for p in crew_list}
     crew_shifts = {p: [] for p in crew_list}
@@ -249,127 +316,151 @@ def main():
     st.subheader("Operations & Strike Shift Optimizer")
 
     # --- SIDEBAR CONTROLS ---
-    st.sidebar.header("⚙️ Configuration")
+    st.sidebar.header("📥 Data Source")
 
-    sheet_id = st.sidebar.text_input("Google Sheet ID", value=DEFAULT_SHEET_ID)
-    gid = st.sidebar.text_input("Worksheet GID", value="0")
+    data_source_mode = st.sidebar.radio(
+        "Choose Ingestion Method:",
+        ["Direct CSV Upload (Instant)", "Google Sheet Live Sync"],
+    )
 
-    if st.sidebar.button("🔄 Sync with Google Sheet", use_container_width=True):
-        st.cache_data.clear()
-        st.sidebar.success("Cache cleared! Reloaded live data.")
+    raw_df = pd.DataFrame()
 
-    # Load Data
-    raw_df = load_survey_data(sheet_id, gid)
+    if data_source_mode == "Direct CSV Upload (Instant)":
+        uploaded_file = st.sidebar.file_uploader(
+            "Upload Survey CSV",
+            type=["csv"],
+            help="Export from Jotform or Google Sheets and drop it here.",
+        )
+        if uploaded_file is not None:
+            raw_df = pd.read_csv(uploaded_file)
+    else:
+        sheet_url = st.sidebar.text_input(
+            "Google Sheet Link or ID",
+            value=DEFAULT_SHEET_ID,
+            help="Paste full URL or Sheet ID.",
+        )
+        gid_val = st.sidebar.text_input(
+            "Worksheet GID",
+            value="",
+            placeholder="e.g. 174829392 (check end of sheet URL)",
+        )
+        if st.sidebar.button(
+            "🔄 Sync with Google Sheet", use_container_width=True
+        ):
+            st.cache_data.clear()
+
+        # Ingestion logic with fallbacks
+        sheet_id = sheet_url.strip()
+        id_m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
+        if id_m:
+            sheet_id = id_m.group(1)
+        gid_m = re.search(r"[#&?]gid=([0-9]+)", sheet_url)
+        if gid_m and not gid_val:
+            gid_val = gid_m.group(1)
+
+        urls = []
+        if gid_val:
+            urls.append(
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid_val}"
+            )
+            urls.append(
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid_val}"
+            )
+        urls.append(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
+        )
+        urls.append(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+        )
+
+        for u in urls:
+            try:
+                res = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+                if res.status_code == 200 and len(res.content) > 50:
+                    raw_df = pd.read_csv(io.StringIO(res.text))
+                    break
+            except Exception:
+                continue
 
     if raw_df.empty:
-        st.warning("⚠️ No data loaded. Check the Google Sheet ID and permissions.")
-        st.stop()
-
-    df, detected_shifts, name_col = clean_and_parse_roster(raw_df)
-
-    if not detected_shifts:
-        st.error(
-            "Could not detect shift columns automatically. Please verify survey columns."
+        st.info(
+            "👈 Please upload your survey CSV or connect the Google Sheet in the sidebar to begin."
         )
-        st.dataframe(raw_df.head(5))
         st.stop()
 
-    crew_list = sorted(df[name_col].dropna().unique().tolist())
+    (
+        df,
+        crew_list,
+        concrete_shifts,
+        shift_meta,
+        availability_matrix,
+        notes_col,
+    ) = parse_raw_dataframe(raw_df)
 
-    # Build Availability Lookup Matrix
-    availability_matrix = {}
-    for _, row in df.iterrows():
-        person = row[name_col]
-        for s in detected_shifts:
-            availability_matrix[(person, s)] = is_available(row.get(s, None))
-
-    # Sidebar Metrics
     st.sidebar.markdown("---")
     st.sidebar.metric("Active Crew Members", len(crew_list))
-    st.sidebar.metric("Detected Shifts", len(detected_shifts))
+    st.sidebar.metric("Concrete Shifts Detected", len(concrete_shifts))
 
     max_shifts_slider = st.sidebar.slider(
         "Max Shifts Per Person",
         min_value=1,
-        max_value=max(len(detected_shifts), 1),
-        value=min(4, max(len(detected_shifts), 1)),
-        help="Hard cap on the number of shifts any single crew member can be scheduled for.",
+        max_value=max(len(concrete_shifts), 1),
+        value=min(6, max(len(concrete_shifts), 1)),
+        help="Hard cap on total shifts assigned to any single individual.",
     )
 
-    # --- TABS INTERFACE ---
+    # Tabs
     tab_setup, tab_roster, tab_optimizer, tab_crew_view = st.tabs([
         "📋 Shift Targets & Roles",
-        "👥 Survey Data & Availability",
+        "👥 Survey Responses & Notes",
         "🚀 Run Optimizer & Master Schedule",
         "👤 Crew-Centric View",
     ])
 
     # -------------------------------------------------------------
-    # TAB 1: SHIFT REQUIREMENTS & OVERLAP SETUP
+    # TAB 1: SHIFT REQUIREMENTS & HEADCOUNT
     # -------------------------------------------------------------
     with tab_setup:
         st.markdown(
-            "Configure the **Needed Headcount**, assigned **Role / Scope**, and **Time Slot** for each shift."
-        )
-        st.caption(
-            "💡 Shifts with the same *Overlap Group* will never assign the same person to both (e.g. FOH and Concessions during the same show)."
+            "Adjust the **Needed Headcount** for each shift. Shifts occurring at the same time on the same date will automatically prevent double-booking."
         )
 
-        # Prepopulate shift configuration DataFrame
         default_config = []
-        for s in detected_shifts:
-            # Smart default role guessing
-            s_lower = s.lower()
-            if "strike" in s_lower:
-                role = "Strike Crew"
-                group = "Strike Tear Down"
-            elif "concession" in s_lower:
-                role = "Concessions"
-                group = re.sub(
-                    r"concession[s]?", "", s, flags=re.IGNORECASE
-                ).strip()
-            elif "usher" in s_lower:
-                role = "Ushers"
-                group = re.sub(r"usher[s]?", "", s, flags=re.IGNORECASE).strip()
-            elif "foh" in s_lower or "front of house" in s_lower:
-                role = "Front of House"
-                group = re.sub(
-                    r"foh|front of house", "", s, flags=re.IGNORECASE
-                ).strip()
-            else:
-                role = "General Operations"
-                group = s
-
+        for s in concrete_shifts:
+            meta = shift_meta[s]
+            role = meta["role"]
+            needed = 4 if role == "Strike Crew" else 3
             default_config.append({
-                "Shift Name": s,
+                "Shift Identifier": s,
+                "Day / Event": meta["day"],
+                "Time Window": meta["time"],
                 "Role / Scope": role,
-                "Overlap Group (Concurrent)": group or s,
-                "Needed Headcount": 3,  # Sensible default for circus FOH/concessions
+                "Needed Headcount": needed,
             })
 
         config_df = pd.DataFrame(default_config)
 
-        # Interactive Data Editor
         edited_config = st.data_editor(
             config_df,
             column_config={
-                "Shift Name": st.column_config.TextColumn(
-                    "Shift Column", disabled=True
+                "Shift Identifier": st.column_config.TextColumn(
+                    "Shift", disabled=True
+                ),
+                "Day / Event": st.column_config.TextColumn(
+                    "Day", disabled=True
+                ),
+                "Time Window": st.column_config.TextColumn(
+                    "Time", disabled=True
                 ),
                 "Role / Scope": st.column_config.SelectboxColumn(
                     "Role Category",
                     options=[
-                        "Front of House",
-                        "Concessions",
-                        "Ushers",
+                        "Operations (FOH / Ushers / Concessions)",
+                        "Concessions Training",
+                        "Set-up Crew",
                         "Strike Crew",
-                        "General Operations",
                     ],
                     required=True,
-                ),
-                "Overlap Group (Concurrent)": st.column_config.TextColumn(
-                    "Overlap Group",
-                    help="Shifts sharing the exact same group name cannot be assigned to the same volunteer.",
                 ),
                 "Needed Headcount": st.column_config.NumberColumn(
                     "Needed Headcount", min_value=0, max_value=50, step=1
@@ -379,66 +470,54 @@ def main():
             use_container_width=True,
         )
 
-        # Build dictionaries from edited configuration
         shift_targets = dict(
             zip(
-                edited_config["Shift Name"],
+                edited_config["Shift Identifier"],
                 edited_config["Needed Headcount"].astype(int),
             )
         )
         total_slots_needed = sum(shift_targets.values())
+        total_slots_offered = sum(availability_matrix.values())
 
-        # Group shifts by overlap
-        overlap_groups = {}
-        for _, row in edited_config.iterrows():
-            grp = row["Overlap Group (Concurrent)"]
-            s_name = row["Shift Name"]
-            overlap_groups.setdefault(grp, []).append(s_name)
-
-        col_m1, col_m2 = st.columns(2)
-        col_m1.metric("Total Crew Slots Needed", total_slots_needed)
-        total_avail_slots = sum(availability_matrix.values())
-        col_m2.metric("Total Volunteer Availabilities", total_avail_slots)
+        c1, c2 = st.columns(2)
+        c1.metric("Total Headcount Needed", total_slots_needed)
+        c2.metric("Total Availabilities Submitted", total_slots_offered)
 
     # -------------------------------------------------------------
-    # TAB 2: SURVEY DATA & AVAILABILITY MATRIX
+    # TAB 2: CREW AVAILABILITY & NOTES
     # -------------------------------------------------------------
     with tab_roster:
         st.markdown(
-            f"**Cleaned Submissions ({len(df)} crew members)** — *Deduplicated & Test entries removed*"
+            f"**Cleaned Submissions ({len(df)} crew members)** — *Test entries purged, duplicates removed.*"
         )
 
-        avail_summary = []
+        crew_overview = []
         for p in crew_list:
-            count = sum(
-                availability_matrix.get((p, s), False) for s in detected_shifts
+            avail_count = sum(
+                availability_matrix.get((p, s), False) for s in concrete_shifts
             )
-            avail_summary.append({name_col: p, "Shifts Offered": count})
-        avail_summary_df = pd.DataFrame(avail_summary).sort_values(
-            by="Shifts Offered", ascending=False
+            note = (
+                df[df["Full Name"] == p][notes_col].values[0]
+                if notes_col and not df[df["Full Name"] == p].empty
+                else ""
+            )
+            crew_overview.append({
+                "Crew Member": p,
+                "Total Shifts Available": avail_count,
+                "Special Requests & Notes": note if pd.notna(note) else "",
+            })
+
+        st.dataframe(
+            pd.DataFrame(crew_overview),
+            hide_index=True,
+            use_container_width=True,
         )
-
-        col_left, col_right = st.columns([1, 2])
-        with col_left:
-            st.dataframe(avail_summary_df, hide_index=True)
-
-        with col_right:
-            # Boolean visual grid
-            display_grid = df[[name_col] + detected_shifts].copy()
-            for s in detected_shifts:
-                display_grid[s] = display_grid[s].apply(
-                    lambda v: "✅ Yes" if is_available(v) else "❌ No"
-                )
-            st.dataframe(display_grid, hide_index=True)
 
     # -------------------------------------------------------------
-    # TAB 3: OPTIMIZER & MASTER SCHEDULE
+    # TAB 3: RUN OPTIMIZER & MASTER SCHEDULE
     # -------------------------------------------------------------
     with tab_optimizer:
-        st.markdown("### Run Mathematical Optimization Engine")
-        st.write(
-            "This will solve for the optimal assignments respecting all time overlaps, availability, and capacity targets."
-        )
+        st.markdown("### Run PuLP Optimization Engine")
 
         if st.button(
             "🚀 Run Optimization", type="primary", use_container_width=True
@@ -447,15 +526,14 @@ def main():
                 status, assignments, crew_totals, crew_shifts, shortfall_counts = (
                     solve_schedule(
                         crew_list=crew_list,
-                        shifts=detected_shifts,
+                        shifts=concrete_shifts,
+                        shift_meta=shift_meta,
                         availability_matrix=availability_matrix,
                         shift_targets=shift_targets,
-                        overlap_groups=overlap_groups,
                         max_shifts_per_person=max_shifts_slider,
                     )
                 )
 
-            # Save state in session_state
             st.session_state["opt_results"] = {
                 "status": status,
                 "assignments": assignments,
@@ -466,7 +544,6 @@ def main():
                 "edited_config": edited_config,
             }
 
-        # Check if results are stored
         if "opt_results" in st.session_state:
             results = st.session_state["opt_results"]
             status = results["status"]
@@ -476,32 +553,32 @@ def main():
             cfg = results["edited_config"]
 
             if status in ["Optimal", "Feasible"]:
-                total_shortfall = sum(shortfall_counts.values())
-                if total_shortfall == 0:
-                    st.success("🎉 Schedule is fully staffed with zero gaps!")
+                total_short = sum(shortfall_counts.values())
+                if total_short == 0:
+                    st.success("🎉 Schedule is 100% staffed with zero gaps!")
                 else:
                     st.warning(
-                        f"⚠️ Staffing capacity warning: **{total_shortfall} unfilled slots** across the schedule. See flagged shifts below."
+                        f"⚠️ Notice: **{total_short} slot(s) unfilled** due to volunteer availability or Max Shift limits."
                     )
 
-                # Build Master Schedule Table
                 master_rows = []
                 for _, row in cfg.iterrows():
-                    s = row["Shift Name"]
+                    s = row["Shift Identifier"]
                     role = row["Role / Scope"]
                     needed = shift_targets_ref[s]
                     assigned = assignments.get(s, [])
                     assigned_count = len(assigned)
-                    missing = shortfall_counts.get(s, 0)
+                    short = shortfall_counts.get(s, 0)
 
-                    status_str = "✅ Full" if missing == 0 else f"🚨 Short {missing}"
+                    status_str = "✅ Full" if short == 0 else f"🚨 Short {short}"
                     assigned_str = ", ".join(assigned) if assigned else "—"
 
                     master_rows.append({
-                        "Shift Name": s,
+                        "Day / Event": row["Day / Event"],
+                        "Time Window": row["Time Window"],
                         "Role": role,
                         "Needed": needed,
-                        "Assigned Count": assigned_count,
+                        "Assigned": assigned_count,
                         "Status": status_str,
                         "Assigned Crew": assigned_str,
                     })
@@ -509,62 +586,51 @@ def main():
                 master_df = pd.DataFrame(master_rows)
                 st.dataframe(master_df, hide_index=True, use_container_width=True)
 
-                # Export CSV
-                csv_buffer = io.StringIO()
-                master_df.to_csv(csv_buffer, index=False)
+                csv_buf = io.StringIO()
+                master_df.to_csv(csv_buf, index=False)
                 st.download_button(
                     label="📥 Download Master Schedule as CSV",
-                    data=csv_buffer.getvalue(),
+                    data=csv_buf.getvalue(),
                     file_name="circus_bella_master_schedule.csv",
                     mime="text/csv",
                 )
-            else:
-                st.error(
-                    f"Solver failed to find a valid solution. Solver status: {status}"
-                )
 
     # -------------------------------------------------------------
-    # TAB 4: CREW-CENTRIC SUMMARY
+    # TAB 4: CREW-CENTRIC VIEW
     # -------------------------------------------------------------
     with tab_crew_view:
         if "opt_results" in st.session_state:
             results = st.session_state["opt_results"]
-            crew_totals = results["crew_totals"]
             crew_shifts = results["crew_shifts"]
-
-            st.markdown("### Individual Crew Rosters & Workload Distribution")
 
             crew_rows = []
             for p in sorted(crew_list):
                 shifts_assigned = crew_shifts.get(p, [])
                 crew_rows.append({
                     "Crew Member": p,
-                    "Total Shifts Assigned": len(shifts_assigned),
-                    "Assigned Shifts List": (
+                    "Total Assigned Shifts": len(shifts_assigned),
+                    "Assigned Schedule": (
                         " | ".join(shifts_assigned)
                         if shifts_assigned
-                        else "None (Available Backup)"
+                        else "No shifts assigned (Backup)"
                     ),
                 })
 
             crew_df = pd.DataFrame(crew_rows).sort_values(
-                by="Total Shifts Assigned", ascending=False
+                by="Total Assigned Shifts", ascending=False
             )
             st.dataframe(crew_df, hide_index=True, use_container_width=True)
 
-            # Export Crew View CSV
-            crew_csv_buffer = io.StringIO()
-            crew_df.to_csv(crew_csv_buffer, index=False)
+            crew_csv_buf = io.StringIO()
+            crew_df.to_csv(crew_csv_buf, index=False)
             st.download_button(
-                label="📥 Download Crew Roster Summary as CSV",
-                data=crew_csv_buffer.getvalue(),
+                label="📥 Download Crew Summary as CSV",
+                data=crew_csv_buf.getvalue(),
                 file_name="circus_bella_crew_summary.csv",
                 mime="text/csv",
             )
         else:
-            st.info(
-                "Please run the optimization in Tab 3 to view the crew summary."
-            )
+            st.info("Run the optimization in Tab 3 to view individual schedules.")
 
 
 if __name__ == "__main__":
